@@ -1,19 +1,3 @@
-// --- ESP32 Sensor Bridge Comprehensive Workflow ---
-
-// This code integrates the Ultra-Low Power (ULP) co-processor for deep sleep wakeups,
-// ESP-NOW for robust wireless communication with failover/failback mechanisms,
-// and PWM decoding for sensor data from a CH32V003 microcontroller.
-// It also adds NVS (Non-Volatile Storage) for persisting operating mode and target node ID,
-// and implements a "Data Collection Mode" for continuous high-rate data acquisition.
-//
-// Author: Gemini
-// Date: June 23, 2025 (Modified: June 24, 2025 for NVS and Data Collection Mode, wakeup sync fix, and ACK-based AR announcements)
-// Modified: June 24, 2025 for AR Takeback Logic
-// Modified: June 24, 2025 for TCP Server functionality
-// Modified: June 24, 2025 to fix LoadProhibited error by reordering WiFi and ESP-NOW initialization
-// Modified: June 24, 2025 to enable TCP server to update with data from other nodes
-// Modified: June 26, 2025 to add PC-based mode switching via TCP endpoint
-
 // --- Includes ---
 #include <esp_now.h>
 #include <WiFi.h>
@@ -21,9 +5,12 @@
 #include <nvs.h>       // For NVS operations
 #include "hulp_arduino.h" // Assuming this library is available for ULP interactions
 #include <WebServer.h> // New include for WebServer (TCP functionality)
+#include <FS.h>        // For File System (SD card)
+#include <SD.h>        // Changed from SD_MMC.h to SD.h for SPI communication
+#include <SPI.h>       // Required for SD.h when using SPI
 
 // --- Global Constants and Defines for ESP-NOW and System ---
-#define WIFI_CHANNEL 1              // WiFi channel for ESP-NOW communication
+#define WIFI_CHANNEL 1
 #define PROBE_INTERVAL 7000         // Interval (ms) for receivers to probe higher-priority nodes for AR Takeback
 #define FAILOVER_THRESHOLD 3        // Number of consecutive send failures to trigger failover
 #define RETRY_DELAY_MS 500          // Delay (ms) before retrying a failed ESP-NOW send
@@ -80,7 +67,9 @@ const unsigned long BUTTON_DEBOUNCE_DELAY = 200; // Debounce delay for push butt
 uint8_t nodeMacs[][ESP_NOW_ETH_ALEN] = {
     {0x10, 0x06, 0x1C, 0x82, 0x70, 0x54}, // Node 1 MAC (Highest Priority)
     {0x5C, 0x01, 0x3B, 0x4E, 0x08, 0xFC}, // Node 2 MAC
-    {0xF0, 0x24, 0xF9, 0x59, 0xD3, 0xBC}   // Node 3 MAC (Lowest Priority)
+    {0xF0, 0x24, 0xF9, 0x59, 0xD3, 0xBC},   // Node 3 MAC 
+    {0xF0, 0x24, 0xF9, 0x5A, 0x4A, 0xC4},
+    {0xF0, 0x24, 0xF9, 0x5A, 0xB3, 0x10}
 };
 #define MAX_NODES (sizeof(nodeMacs) / ESP_NOW_ETH_ALEN) // Calculate the number of nodes
 uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Standard Broadcast MAC address
@@ -132,6 +121,18 @@ struct_message messageToSend; // Global message structure to avoid re-creation o
 // This is used by the AR (Node 1) to manage which nodes need a mode announcement ACK.
 bool nodeModeSynced[MAX_NODES + 1]; // Index 0 unused, nodes 1 to MAX_NODES
 
+// SD Card and Blackbox related globals
+bool sdCardInitialized = false;
+const char* SD_LOG_FILE = "/sensor_log.csv";
+RTC_DATA_ATTR unsigned long lastTcpConnectionTime = 0; // Timestamp of last successful TCP server interaction
+const unsigned long TCP_DISCONNECT_BUFFER_THRESHOLD = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+// --- SPI Pins for SD Card (Typical ESP32 VSPI defaults) ---
+#define SD_SCK_PIN  18
+#define SD_MISO_PIN 19
+#define SD_MOSI_PIN 23
+#define SD_CS_PIN   5 // Can be any available GPIO
+
 // --- Global Constants and Defines for PWM Decoder (from fin_pwm_decode.txt) ---
 const int TILT_PWM_PIN = 13;      // ESP32 GPIO connected to CH32 PC4 (Tilt PWM output)
 const int VIBRATION_PWM_PIN = 14; // ESP32 GPIO connected to CH32 PD4 (Vibration PWM output)
@@ -150,11 +151,11 @@ const long CH32_PWM_MAX_DUTY_VALUE = 4799;
 
 // PWM Frequencies from the CH32V003 code.
 const long TILT_PWM_FREQUENCY_HZ = 10;
-const long VIBRATION_PWM_FREQUENCY_HZ = 1;
+const long VIBRATION_PWM_FREQUENCY_HZ = 10; // CORRECTED: Was 1, now 10 to match CH32
 
 // Calculate PWM periods in microseconds.
 const long TILT_PWM_PERIOD_US = 1000000L / TILT_PWM_FREQUENCY_HZ;         // 100,000 us
-const long VIBRATION_PWM_PERIOD_US = 1000000L / VIBRATION_PWM_FREQUENCY_HZ; // 1,000,000 us
+const long VIBRATION_PWM_PERIOD_US = 1000000L / VIBRATION_PWM_FREQUENCY_HZ; // 100,000 us (corrected)
 
 // WebServer instance for TCP communication
 WebServer server(80);
@@ -264,46 +265,133 @@ void writeTargetNodeIdToNVS(int id) {
     nvs_close(nvs_handle);
 }
 
+// --- SD Card Helper Functions ---
+
+// Function to log sensor data to the SD card.
+// This function is called when TCP connection is not active for a long time (blackbox mode).
+void logSensorDataToSD(int nodeId, const CurrentSensorReadings& data_entry) {
+    if (!sdCardInitialized) {
+        // Serial.println("SD card not initialized, skipping log."); // Too verbose for loop
+        return;
+    }
+
+    File file = SD.open(SD_LOG_FILE, FILE_APPEND); // Changed to SD.open
+    if (!file) {
+        Serial.println("❌ Failed to open SD log file for appending.");
+        return;
+    }
+
+    // Format: Timestamp,NodeID,MAC,Rain,Soil,Vibration(milli-g),Tilt(centi-deg)
+    String macString = "";
+    for (int j = 0; j < ESP_NOW_ETH_ALEN; j++) {
+        if (j > 0) macString += ":";
+        char hex[3];
+        sprintf(hex, "%02X", data_entry.mac_addr[j]);
+        macString += hex;
+    }
+
+    file.printf("%lu,%d,%s,%d,%d,%ld,%ld\n",
+                data_entry.lastUpdated, // Using lastUpdated as a timestamp
+                nodeId,
+                macString.c_str(),
+                data_entry.rain_adc_value,
+                data_entry.soil_adc_value,
+                data_entry.vibration_milli_g,
+                data_entry.tilt_centi_deg);
+
+    file.close();
+    // Serial.println("📦 Data logged to SD card."); // Too verbose for loop
+}
+
+// Function to read all historical data from SD card and clear the file.
+String readAndClearSDLog() {
+    if (!sdCardInitialized) {
+        Serial.println("SD card not initialized, cannot read historical data.");
+        return "SD card not initialized.";
+    }
+
+    File file = SD.open(SD_LOG_FILE, FILE_READ); // Changed to SD.open
+    if (!file) {
+        Serial.println("❌ Failed to open SD log file for reading.");
+        return "No historical data available or failed to open file.";
+    }
+
+    String historicalData = "";
+    while (file.available()) {
+        historicalData += (char)file.read();
+    }
+    file.close();
+
+    // After reading, delete the file and recreate it with the header
+    if (SD.remove(SD_LOG_FILE)) { // Changed to SD.remove
+        Serial.println("✅ SD log file cleared.");
+        File newFile = SD.open(SD_LOG_FILE, FILE_WRITE); // Changed to SD.open
+        if (newFile) {
+            newFile.println("Timestamp,NodeID,MAC,Rain,Soil,Vibration(milli-g),Tilt(centi-deg)");
+            newFile.close();
+        } else {
+            Serial.println("❌ Failed to recreate SD log file with header.");
+        }
+    } else {
+        Serial.println("❌ Failed to remove SD log file.");
+    }
+
+    return historicalData;
+}
+
+
 // --- TCP Server Handler Functions ---
 
 // This function handles requests to the /sensor_data endpoint, providing current sensor values.
-// It now supports a nodeId parameter to fetch data for other nodes.
+// It now returns data for all initialized nodes in a single JSON array,
+// with tilt and vibration values formatted as decimals.
 void handleSensorData() {
-    int requestedNodeId = myNodeId; // Default to this node's data
-    if (server.hasArg("nodeId")) {
-        requestedNodeId = server.arg("nodeId").toInt();
-    }
+    lastTcpConnectionTime = millis(); // Update last connection time on any data request
 
-    // Check if the requested nodeId is valid and if data for it is initialized
-    if (requestedNodeId >= 1 && requestedNodeId <= MAX_NODES && latestNodeData[requestedNodeId].initialized) {
-        String macString = "";
-        for (int i = 0; i < ESP_NOW_ETH_ALEN; i++) {
-            if (i > 0) macString += ":";
-            char hex[3];
-            sprintf(hex, "%02X", latestNodeData[requestedNodeId].mac_addr[i]);
-            macString += hex;
+    String jsonArray = "[";
+    bool firstEntry = true;
+
+    for (int i = 1; i <= MAX_NODES; ++i) { // Iterate from Node 1 to MAX_NODES
+        if (latestNodeData[i].initialized) {
+            if (!firstEntry) {
+                jsonArray += ",";
+            }
+            firstEntry = false;
+
+            String macString = "";
+            for (int j = 0; j < ESP_NOW_ETH_ALEN; j++) {
+                if (j > 0) macString += ":";
+                char hex[3];
+                sprintf(hex, "%02X", latestNodeData[i].mac_addr[j]);
+                macString += hex;
+            }
+
+            // Convert centi-degrees to degrees (float)
+            float tilt_degrees = latestNodeData[i].tilt_centi_deg / 100.0;
+            // Convert milli-g to g (float)
+            float vibration_g = latestNodeData[i].vibration_milli_g / 1000.0;
+
+            jsonArray += "{";
+            jsonArray += "\"nodeId\": " + String(i) + ",";
+            jsonArray += "\"mac\": \"" + macString + "\",";
+            jsonArray += "\"rain\": " + String(latestNodeData[i].rain_adc_value) + ",";
+            jsonArray += "\"soil\": " + String(latestNodeData[i].soil_adc_value) + ",";
+            jsonArray += "\"vibration\": " + String(vibration_g, 3) + ","; // Format to 3 decimal places
+            jsonArray += "\"tilt\": " + String(tilt_degrees, 2) + ",";    // Format to 2 decimal places
+            jsonArray += "\"lastUpdated\": " + String(latestNodeData[i].lastUpdated);
+            jsonArray += "}";
         }
-
-        String json = "{";
-        json += "\"nodeId\": " + String(requestedNodeId) + ",";
-        json += "\"mac\": \"" + macString + "\",";
-        json += "\"rain\": " + String(latestNodeData[requestedNodeId].rain_adc_value) + ",";
-        json += "\"soil\": " + String(latestNodeData[requestedNodeId].soil_adc_value) + ",";
-        json += "\"vibration\": " + String(latestNodeData[requestedNodeId].vibration_milli_g) + ",";
-        json += "\"tilt\": " + String(latestNodeData[requestedNodeId].tilt_centi_deg) + ",";
-        json += "\"lastUpdated\": " + String(latestNodeData[requestedNodeId].lastUpdated);
-        json += "}";
-        server.send(200, "application/json", json);
-        Serial.printf("Served /sensor_data request for Node %d with: %s\n", requestedNodeId, json.c_str());
-    } else {
-        // Send a 404 Not Found or an error message if data is not available or nodeId is invalid
-        server.send(404, "application/json", "{\"error\":\"Sensor data for requested nodeId not found or invalid.\"}");
-        Serial.printf("Failed to serve /sensor_data request for Node %d: Data not available or invalid nodeId.\n", requestedNodeId);
     }
+    jsonArray += "]";
+
+    server.send(200, "application/json", jsonArray);
+    Serial.printf("Served /sensor_data request with all node data: %s\n", jsonArray.c_str());
 }
 
 // New handler for setting operating mode via PC.
 void handleSetMode() {
+    lastTcpConnectionTime = millis(); // Update last connection time on any data request
+
     if (server.hasArg("mode")) {
         String modeStr = server.arg("mode");
         operating_mode_t newMode;
@@ -373,6 +461,20 @@ void handleSetMode() {
     }
 }
 
+// New handler for fetching historical data from SD card
+void handleHistoricalData() {
+    lastTcpConnectionTime = millis(); // Update last connection time on any data request
+
+    String historicalData = readAndClearSDLog();
+    if (sdCardInitialized) {
+        server.send(200, "text/csv", historicalData); // Send as CSV
+        Serial.printf("Served /historical_data request. Data size: %d bytes\n", historicalData.length());
+    } else {
+        server.send(500, "text/plain", "SD card not initialized. No historical data available.");
+        Serial.println("Failed to serve /historical_data: SD card not initialized.");
+    }
+}
+
 // --- Role Management Functions ---
 // Transitions the current node to an Active Receiver (AR) role.
 // An AR stays awake to receive data from senders and periodically probes.
@@ -397,6 +499,7 @@ void becomeActiveReceiver() {
     // Register web server routes
     server.on("/sensor_data", HTTP_GET, handleSensorData);
     server.on("/set_mode", HTTP_GET, handleSetMode); // Register the new mode control endpoint
+    server.on("/historical_data", HTTP_GET, handleHistoricalData); // Register new historical data endpoint
     server.begin(); // Start the web server
     Serial.println("Web server started.");
 
@@ -584,6 +687,11 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
                 latestNodeData[senderId].lastUpdated = millis();
                 latestNodeData[senderId].initialized = true;
                 Serial.printf("[Node %d AR] Stored data for Node %d.\n", myNodeId, senderId);
+
+                // --- SD Card Blackbox Logic for received data ---
+                if (sdCardInitialized && (millis() - lastTcpConnectionTime > TCP_DISCONNECT_BUFFER_THRESHOLD)) {
+                    logSensorDataToSD(senderId, latestNodeData[senderId]);
+                }
             }
 
             // NEW: Send ANNOUNCE_AR back as an acknowledgment for received data if not already synced
@@ -657,7 +765,7 @@ void decodePwmSignals(long& decoded_tilt, long& decoded_vibration_milli_g) {
         // Serial.print("Warning: No Tilt PWM signal detected or timeout on pin "); // Commented out by Gemini
         // Serial.println(TILT_PWM_PIN); // Commented out by Gemini
     }
-    // --- Decode Vibration PWM (from PD4/TIM2, 1Hz) ---
+    // --- Decode Vibration PWM (from PD4/TIM2, 10Hz) --- // Corrected comment
     // Measure the high pulse duration for Vibration PWM in microseconds.
     long vibration_pulse_us = pulseIn(VIBRATION_PWM_PIN, HIGH, VIBRATION_PWM_PERIOD_US * 2);
     long decoded_vibration_mdps = 0;
@@ -825,6 +933,32 @@ void setup() {
     pinMode(VIBRATION_PWM_PIN, INPUT);
     pinMode(PUSH_BUTTON_PIN, INPUT_PULLUP); // Configure push button with pull-up
 
+    // Initialize SD card using SD.h library for SPI
+    Serial.println("Attempting to initialize SD card via SPI...");
+    // Explicitly set SPI pins: SCK, MISO, MOSI
+    SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN); 
+
+    if (!SD.begin(SD_CS_PIN)) { // Pass the CS pin to SD.begin()
+        Serial.println("💀 SD card init failed! SD card functions will be skipped.");
+        sdCardInitialized = false;
+    } else {
+        Serial.println("✅ SD card init success!");
+        sdCardInitialized = true;
+        // Create CSV header if file doesn't exist
+        if (!SD.exists(SD_LOG_FILE)) { // Use SD.exists()
+            File file = SD.open(SD_LOG_FILE, FILE_WRITE); // Use SD.open()
+            if (file) {
+                file.println("Timestamp,NodeID,MAC,Rain,Soil,Vibration(milli-g),Tilt(centi-deg)");
+                file.close();
+                Serial.println("✅ SD log file header created.");
+            } else {
+                Serial.println("❌ Failed to create SD log file header.");
+            }
+        } else {
+            Serial.println("SD log file already exists.");
+        }
+    }
+    lastTcpConnectionTime = millis(); // Initialize last TCP connection time
 
     // Check if wakeup was from ULP deep sleep.
     if (hulp_is_deep_sleep_wakeup()) {
@@ -878,7 +1012,7 @@ void setup() {
                         delay(10); // Small delay to allow other tasks (like ESP-NOW receive) to run
                         // If mode has changed by onDataRecv callback, break out of this wait
                         if (currentOperatingMode == DATA_COLLECTION_MODE) {
-                            Serial.printf("[Node %d] Mode updated during setup() wait to DATA_COLLECTION_MODE. Breaking wait.\n", myNodeId);
+                            Serial.printf("[Node %d] Mode updated during setup() wait to DATA_COLLECTION_MODE. Bypassing deep sleep.\n", myNodeId);
                             break; // Exit the while loop early
                         }
                     }
@@ -1071,7 +1205,7 @@ void loop() {
                     // If mode has changed by onDataRecv callback, break out of this wait
                     if (currentOperatingMode == DATA_COLLECTION_MODE) {
                         Serial.printf("[Node %d] Mode updated during post-send wait to DATA_COLLECTION_MODE. Bypassing deep sleep.\n", myNodeId);
-                        return; // Immediately re-evaluate loop in new mode
+                        return; // Exit current loop iteration to re-evaluate operating mode
                     }
                 }
                 Serial.printf("[Node %d] Exited AR mode sync wait. Final mode after wait: %s\n",
@@ -1165,6 +1299,11 @@ void loop() {
                 latestNodeData[myNodeId].tilt_centi_deg = current_tilt_centi_deg;
                 latestNodeData[myNodeId].lastUpdated = millis();
                 latestNodeData[myNodeId].initialized = true; // Ensure it's marked as initialized
+
+                // --- SD Card Blackbox Logic for local data ---
+                if (sdCardInitialized && (millis() - lastTcpConnectionTime > TCP_DISCONNECT_BUFFER_THRESHOLD)) {
+                    logSensorDataToSD(myNodeId, latestNodeData[myNodeId]);
+                }
             }
             delay(20); // Keep receiver node alive and responsive by yielding CPU periodically
         }
@@ -1257,6 +1396,10 @@ void loop() {
                                   current_tilt_centi_deg / 100, abs(current_tilt_centi_deg % 100),
                                   current_vibration_milli_g / 1000, abs(current_vibration_milli_g % 1000),
                                   currentRainADC, currentSoilADC);
+                // --- SD Card Blackbox Logic for local data ---
+                if (sdCardInitialized && (millis() - lastTcpConnectionTime > TCP_DISCONNECT_BUFFER_THRESHOLD)) {
+                    logSensorDataToSD(myNodeId, latestNodeData[myNodeId]);
+                }
             }
             delay(20); // Keep receiver node alive and responsive
         }
