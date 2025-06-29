@@ -62,7 +62,6 @@ The ESP32 runs a **TCP server** on port `80`. The Python script connects to it t
 Python script polls sensor data over TCP and plots:
 
 - Accelerometer (X, Y, Z)
-- Gyro data (if enabled)
 - Rain/Soil analog values
 - Live anomaly score
 - Decision result (annotated)
